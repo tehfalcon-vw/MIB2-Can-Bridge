@@ -8,6 +8,8 @@
   - Bridges frames between two CAN buses
   - Rewrites CAN ID 0x635 so the radio sees a usable brightness value
   - Mirrors Mk5 dash-dimmer byte 0 into MIB2 brightness byte 2
+
+  Assumptions:
   - This is running on a Teensy 4.0
   - Vehicle infotainment CAN is 100 kbit/s
   - CAN1 is connected to the vehicle-side transceiver
@@ -21,13 +23,14 @@
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> canVehicle;
 FlexCAN_T4<CAN2, RX_SIZE_256, TX_SIZE_16> canRadio;
 
+static constexpr const char *FIRMWARE_VERSION = "MK5-FULL-STABLE-2026-07-10";
 static constexpr uint32_t BUS_SPEED = 100000;
 static constexpr uint32_t DIMMING_CAN_ID = 0x635;
 static constexpr uint8_t DIMMING_FRAME_LEN = 3;
 static constexpr uint8_t DEFAULT_DAY_BRIGHTNESS = 0xFD;
 static constexpr uint8_t DEFAULT_LIGHTS_ON_MAX_BRIGHTNESS = 0xD0;
 static constexpr uint8_t DEFAULT_NIGHT_BRIGHTNESS = 0x20;
-static constexpr uint32_t EEPROM_MAGIC = 0x4D494236;  // "MIB6" profile with separate lights-on max brightness
+static constexpr uint32_t EEPROM_MAGIC = 0x4D494237;  // "MIB7" profile with deterministic nav maneuver graphics
 static constexpr int EEPROM_ADDR_MAGIC = 0;
 static constexpr int EEPROM_ADDR_DAY = EEPROM_ADDR_MAGIC + sizeof(uint32_t);
 static constexpr int EEPROM_ADDR_LIGHTS_ON_MAX = EEPROM_ADDR_DAY + sizeof(uint8_t);
@@ -64,6 +67,7 @@ static constexpr uint32_t DDP_SLEEP_IDLE_TIMEOUT_MS = 120000;
 static constexpr uint32_t DDP_WAKE_BURST_GAP_MS = 250;
 static constexpr uint32_t DDP_WAKE_PENDING_ACTIVITY_TIMEOUT_MS = 3000;
 static constexpr uint32_t DDP_SESSION_STUCK_TIMEOUT_MS = 60000;
+static constexpr uint32_t DDP_NAV_GRAPHIC_SETTLE_MS = 120;
 static constexpr uint8_t DDP_WAKE_MIN_BURST_FRAMES = 12;
 static constexpr uint32_t AUDIO_CACHE_SAVE_INTERVAL_MS = 30000;
 // DBC: PQ35 infotainment CAN names 0x66C as BAP_AUDIO from Radio_2DIN.
@@ -102,7 +106,7 @@ static constexpr uint8_t STEERING_BUTTON_RADIO_PREV = 0x03;
 static constexpr bool DEFAULT_DDP_BOOT_ENABLED = true;
 static constexpr bool DEFAULT_AUDIO_TRANSLATE_ENABLED = true;
 static constexpr bool DEFAULT_NAV_TRANSLATE_ENABLED = true;
-static constexpr bool DEFAULT_NAV_ARROW_HINTS_ENABLED = false;
+static constexpr bool DEFAULT_NAV_ARROW_HINTS_ENABLED = true;
 static constexpr bool DEFAULT_STEERING_AUDIO_BUTTONS_ENABLED = true;
 static constexpr bool DEFAULT_DIMMER_MIRROR_ENABLED = false;
 static constexpr bool DEFAULT_DIMMER_SCALE_ENABLED = true;
@@ -148,6 +152,9 @@ enum class DdpState : uint8_t {
   WaitAreaAvailable,
   SendDrawTest,
   WaitDrawAck,
+  WaitNavGraphicDelay,
+  SendNavGraphic,
+  WaitNavGraphicAck,
   Ready,
   Error
 };
@@ -209,14 +216,21 @@ struct BapDecodedFrame {
   uint8_t data[BAP_PAYLOAD_MAX];
 };
 
-struct NavManeuverDescriptorCandidate {
+struct NavManeuverDescriptor {
   bool valid;
-  uint8_t offset;
   uint8_t mainElement;
   uint8_t direction;
   uint8_t zLevel;
   uint8_t sidestreetLen;
-  int8_t score;
+};
+
+enum class NavArrowShape : uint8_t {
+  None,
+  Straight,
+  Left,
+  Right,
+  UTurnLeft,
+  UTurnRight
 };
 
 struct CanIdActivityCounter {
@@ -265,12 +279,9 @@ static char navDistanceText[AUDIO_LINE_MAX] = "";
 static char navManeuverText[AUDIO_LINE_MAX] = "";
 static char navCurrentStreetText[AUDIO_LINE_MAX] = "";
 static char navNextStreetText[AUDIO_LINE_MAX] = "";
-static uint8_t navManeuverCode = 0xFF;
-static uint8_t navManeuverKind = 0xFF;
 static uint8_t navManeuverMainElement = 0xFF;
 static uint8_t navManeuverDirection = 0xFF;
 static uint8_t navManeuverZLevel = 0xFF;
-static uint8_t navManeuverRecordOffset = 0xFF;
 static uint32_t navManeuverUpdates = 0;
 
 void printFrame(const char *prefix, const CAN_message_t &msg) {
@@ -311,6 +322,9 @@ const char *ddpStateName(DdpState state) {
     case DdpState::WaitAreaAvailable: return "WaitAreaAvailable";
     case DdpState::SendDrawTest: return "SendDrawTest";
     case DdpState::WaitDrawAck: return "WaitDrawAck";
+    case DdpState::WaitNavGraphicDelay: return "WaitNavGraphicDelay";
+    case DdpState::SendNavGraphic: return "SendNavGraphic";
+    case DdpState::WaitNavGraphicAck: return "WaitNavGraphicAck";
     case DdpState::Ready: return "Ready";
     case DdpState::Error: return "Error";
   }
@@ -571,8 +585,22 @@ void ddpSetState(DdpState state) {
   }
 }
 
+bool deadlineReached(uint32_t now, uint32_t deadline) {
+  return deadline != 0 && static_cast<int32_t>(now - deadline) >= 0;
+}
+
 void completeDdpDraw(const char *reason) {
-  if (ddpState != DdpState::WaitDrawAck) {
+  if (ddpState == DdpState::WaitDrawAck && ddpTarget == DdpTarget::Navigation &&
+      currentNavArrowShape() != NavArrowShape::None) {
+    if (ddpVerbose) {
+      Serial.print("DDP nav text accepted by ");
+      Serial.println(reason);
+    }
+    ddpSetState(DdpState::WaitNavGraphicDelay);
+    return;
+  }
+
+  if (ddpState != DdpState::WaitDrawAck && ddpState != DdpState::WaitNavGraphicAck) {
     return;
   }
 
@@ -769,6 +797,112 @@ uint8_t appendDdpText(uint8_t *payload, uint8_t offset, uint8_t x, uint8_t y, co
   return offset;
 }
 
+uint8_t appendDdpRectangle(uint8_t *payload, uint8_t offset, uint8_t x, uint8_t y,
+                           uint8_t width, uint8_t height) {
+  if (offset + 11 > BAP_PAYLOAD_MAX) {
+    return offset;
+  }
+
+  payload[offset++] = 0x60;
+  payload[offset++] = 0x09;
+  payload[offset++] = 0x02;
+  payload[offset++] = x;
+  payload[offset++] = 0x00;
+  payload[offset++] = y;
+  payload[offset++] = 0x00;
+  payload[offset++] = width;
+  payload[offset++] = 0x00;
+  payload[offset++] = height;
+  payload[offset++] = 0x00;
+  return offset;
+}
+
+NavArrowShape currentNavArrowShape() {
+  if (!navArrowHintsEnabled || navManeuverMainElement == 0xFF || navManeuverDirection == 0xFF) {
+    return NavArrowShape::None;
+  }
+
+  switch (navManeuverMainElement) {
+    case 0x00:  // No symbol
+    case 0x01:  // No information
+    case 0x03:  // Arrived
+    case 0x04:  // Near destination
+    case 0x05:  // Arrived off-map
+      return NavArrowShape::None;
+    case 0x0F:  // Exit right
+    case 0x11:  // Roundabout side road right
+    case 0x15:  // Roundabout, right-hand traffic
+      return NavArrowShape::Right;
+    case 0x10:  // Exit left
+    case 0x12:  // Roundabout side road left
+    case 0x16:  // Roundabout, left-hand traffic
+      return NavArrowShape::Left;
+    case 0x19:
+      return navManeuverDirection > 0x80 ? NavArrowShape::UTurnRight : NavArrowShape::UTurnLeft;
+    default:
+      break;
+  }
+
+  if (navManeuverDirection == 0x00) {
+    return NavArrowShape::Straight;
+  }
+  if (navManeuverDirection < 0x80) {
+    return NavArrowShape::Left;
+  }
+  if (navManeuverDirection > 0x80) {
+    return NavArrowShape::Right;
+  }
+  return NavArrowShape::UTurnLeft;
+}
+
+void sendDdpNavGraphic() {
+  uint8_t payload[BAP_PAYLOAD_MAX] = {};
+  uint8_t offset = 0;
+  payload[offset++] = 0x09;
+  payload[offset++] = ddpCentralAreaId();
+
+  switch (currentNavArrowShape()) {
+    case NavArrowShape::Straight:
+      offset = appendDdpRectangle(payload, offset, 17, 10, 7, 4);
+      offset = appendDdpRectangle(payload, offset, 13, 14, 15, 4);
+      offset = appendDdpRectangle(payload, offset, 18, 18, 5, 28);
+      break;
+    case NavArrowShape::Left:
+      offset = appendDdpRectangle(payload, offset, 28, 22, 5, 24);
+      offset = appendDdpRectangle(payload, offset, 10, 22, 23, 5);
+      offset = appendDdpRectangle(payload, offset, 6, 18, 8, 4);
+      offset = appendDdpRectangle(payload, offset, 3, 22, 11, 5);
+      offset = appendDdpRectangle(payload, offset, 6, 27, 8, 4);
+      break;
+    case NavArrowShape::Right:
+      offset = appendDdpRectangle(payload, offset, 10, 22, 5, 24);
+      offset = appendDdpRectangle(payload, offset, 10, 22, 23, 5);
+      offset = appendDdpRectangle(payload, offset, 29, 18, 8, 4);
+      offset = appendDdpRectangle(payload, offset, 29, 22, 11, 5);
+      offset = appendDdpRectangle(payload, offset, 29, 27, 8, 4);
+      break;
+    case NavArrowShape::UTurnLeft:
+      offset = appendDdpRectangle(payload, offset, 28, 15, 5, 31);
+      offset = appendDdpRectangle(payload, offset, 12, 15, 21, 5);
+      offset = appendDdpRectangle(payload, offset, 12, 15, 5, 13);
+      offset = appendDdpRectangle(payload, offset, 8, 24, 13, 5);
+      offset = appendDdpRectangle(payload, offset, 11, 29, 7, 4);
+      break;
+    case NavArrowShape::UTurnRight:
+      offset = appendDdpRectangle(payload, offset, 10, 15, 5, 31);
+      offset = appendDdpRectangle(payload, offset, 10, 15, 21, 5);
+      offset = appendDdpRectangle(payload, offset, 26, 15, 5, 13);
+      offset = appendDdpRectangle(payload, offset, 22, 24, 13, 5);
+      offset = appendDdpRectangle(payload, offset, 25, 29, 7, 4);
+      break;
+    case NavArrowShape::None:
+      break;
+  }
+
+  payload[offset++] = 0x08;
+  sendTpPayload(payload, offset);
+}
+
 void sendDdpDraw() {
   uint8_t payload[BAP_PAYLOAD_MAX] = {};
   uint8_t offset = 0;
@@ -778,8 +912,14 @@ void sendDdpDraw() {
 
   switch (ddpTarget) {
     case DdpTarget::Navigation:
-      offset = appendDdpText(payload, offset, 0x03, 0x18, navLine1);
-      offset = appendDdpText(payload, offset, 0x03, 0x34, navLine2);
+      if (currentNavArrowShape() != NavArrowShape::None) {
+        offset = appendDdpText(payload, offset, 0x30, 0x18,
+                               navDistanceText[0] != '\0' ? navDistanceText : "NAV");
+        offset = appendDdpText(payload, offset, 0x03, 0x34, navLine2);
+      } else {
+        offset = appendDdpText(payload, offset, 0x03, 0x18, navLine1);
+        offset = appendDdpText(payload, offset, 0x03, 0x34, navLine2);
+      }
       break;
     case DdpTarget::Audio:
     default:
@@ -923,7 +1063,8 @@ void processDdpPayload(const uint8_t *payload, uint8_t len) {
     }
   }
 
-  if (command == 0x27 && len >= 3 && payload[1] == ddpCentralAreaId()) {
+  if (ddpState == DdpState::WaitDrawAck && command == 0x27 && len >= 3 &&
+      payload[1] == ddpCentralAreaId()) {
     completeDdpDraw("render-complete payload");
   }
 }
@@ -954,7 +1095,9 @@ bool handleDdpVehicleFrame(const CAN_message_t &msg) {
   }
 
   if (control == 0xA3) {
-    completeDdpDraw("post-draw keepalive");
+    if (ddpState == DdpState::WaitDrawAck) {
+      completeDdpDraw("post-draw keepalive");
+    }
     sendDdpConnectionResponse();
     return true;
   }
@@ -995,6 +1138,11 @@ bool handleDdpVehicleFrame(const CAN_message_t &msg) {
         // rapid audio/RDS redraws.
         completeDdpDraw("transport ack");
         break;
+      case DdpState::WaitNavGraphicAck:
+        if (control == ddpExpectedAck) {
+          completeDdpDraw("nav graphic transport ack");
+        }
+        break;
       default:
         break;
     }
@@ -1002,7 +1150,7 @@ bool handleDdpVehicleFrame(const CAN_message_t &msg) {
   }
 
   if (highNibble == 0x90) {
-    if (ddpState == DdpState::WaitDrawAck) {
+    if (ddpState == DdpState::WaitDrawAck || ddpState == DdpState::WaitNavGraphicAck) {
       ddpAcksReceived++;
       completeDdpDraw("transport control 0x9x");
     }
@@ -1057,7 +1205,7 @@ void ddpTick() {
       suspendDdpForSleep();
       return;
     }
-    if (now >= ddpBootStartMs) {
+    if (deadlineReached(now, ddpBootStartMs)) {
       if (ddpVerbose) {
         Serial.println("DDP delayed boot start");
       }
@@ -1087,6 +1235,7 @@ void ddpTick() {
       ddpState != DdpState::SendBindAudio &&
       ddpState != DdpState::SendShowArea &&
       ddpState != DdpState::SendDrawTest &&
+      ddpState != DdpState::SendNavGraphic &&
       ddpState != DdpState::Error &&
       now - ddpStateStartedMs > (ddpState == DdpState::WaitAreaAvailable ? DDP_AREA_AVAILABLE_TIMEOUT_MS : DDP_WAIT_TIMEOUT_MS)) {
     if (ddpVerbose) {
@@ -1118,7 +1267,7 @@ void ddpTick() {
       ddpSetState(DdpState::WaitShowAck);
       break;
     case DdpState::SendDrawTest:
-      if (ddpEarliestDrawMs != 0 && now < ddpEarliestDrawMs) {
+      if (ddpEarliestDrawMs != 0 && !deadlineReached(now, ddpEarliestDrawMs)) {
         break;
       }
       ddpEarliestDrawMs = 0;
@@ -1127,8 +1276,17 @@ void ddpTick() {
       sendDdpDraw();
       ddpSetState(DdpState::WaitDrawAck);
       break;
+    case DdpState::WaitNavGraphicDelay:
+      if (now - ddpStateStartedMs >= DDP_NAV_GRAPHIC_SETTLE_MS) {
+        ddpSetState(DdpState::SendNavGraphic);
+      }
+      break;
+    case DdpState::SendNavGraphic:
+      sendDdpNavGraphic();
+      ddpSetState(DdpState::WaitNavGraphicAck);
+      break;
     case DdpState::Ready:
-      if (ddpNextPeriodicRebindMs != 0 && now >= ddpNextPeriodicRebindMs) {
+      if (deadlineReached(now, ddpNextPeriodicRebindMs)) {
         ddpNextPeriodicRebindMs = 0;
         if (audioPeriodicRefreshAllowed() || navPeriodicRefreshAllowed()) {
           if (ddpVerbose) {
@@ -1214,7 +1372,7 @@ bool hasQualifiedVehicleWakeBurst(uint32_t now) {
     return false;
   }
 
-  return vehicleWakeBurstStartedMs != 0 && now >= vehicleWakeBurstStartedMs;
+  return vehicleWakeBurstStartedMs != 0;
 }
 
 bool isPowerCompatibilityFrame(const CAN_message_t &msg) {
@@ -1607,17 +1765,9 @@ void printNavSniffBapFrame(const BapDecodedFrame &frame, const char *direction) 
   Serial.print(frame.port);
   Serial.print(" len=");
   Serial.print(frame.len);
-  if (frame.canId == BAP_NAVI_CAN_ID && frame.port == 21 && frame.len >= 7) {
-    const NavManeuverDescriptorCandidate descriptor = decodeNavManeuverDescriptorCandidate(frame);
-    char maneuverCode[3] = {};
-    formatHexByte(frame.data[6], maneuverCode);
-    Serial.print(" maneuver=M");
-    Serial.print(maneuverCode);
-    Serial.print(" kind=");
-    Serial.print(frame.data[0], HEX);
+  if (frame.canId == BAP_NAVI_CAN_ID && frame.port == 23 && frame.len >= 4) {
+    const NavManeuverDescriptor descriptor = decodeNavManeuverDescriptor(frame);
     if (descriptor.valid) {
-      Serial.print(" descOff=");
-      Serial.print(descriptor.offset);
       Serial.print(" main=0x");
       Serial.print(descriptor.mainElement, HEX);
       Serial.print(" dir=0x");
@@ -1992,61 +2142,26 @@ const char *navDirectionLabel(uint8_t value) {
   }
 }
 
-bool isCardinalDirectionByte(uint8_t value) {
-  return (value & 0x1F) == 0;
-}
+NavManeuverDescriptor decodeNavManeuverDescriptor(const BapDecodedFrame &frame) {
+  NavManeuverDescriptor descriptor = {false, 0xFF, 0xFF, 0xFF, 0xFF};
 
-NavManeuverDescriptorCandidate decodeNavManeuverDescriptorCandidate(const BapDecodedFrame &frame) {
-  NavManeuverDescriptorCandidate best = {false, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, -1};
-
-  if (frame.port != 21 || frame.len < 4) {
-    return best;
+  // Navigation_SD function 23 serializes Maneuver_1 as
+  // MainElement, Direction, Z_LevelGuidance, then a length-prefixed Sidestreets string.
+  if (frame.port != 23 || frame.len < 4) {
+    return descriptor;
   }
 
-  for (uint8_t offset = 0; offset + 3 < frame.len; ++offset) {
-    const uint8_t mainElement = frame.data[offset];
-    const uint8_t direction = frame.data[offset + 1];
-    const uint8_t zLevel = frame.data[offset + 2];
-    const uint8_t sidestreetLen = frame.data[offset + 3];
-
-    int8_t score = 0;
-    if (mainElement <= 0x33) {
-      score += 1;
-    }
-    if (mainElement >= 0x0B && mainElement <= 0x33) {
-      score += 4;
-    } else if (mainElement <= 0x0A) {
-      score -= 2;
-    }
-    if (isCardinalDirectionByte(direction)) {
-      score += 2;
-    }
-    if (zLevel == 0x00 || zLevel == 0x01 || zLevel == 0x02 || zLevel == 0xFF) {
-      score += 1;
-    }
-    if (sidestreetLen <= 0x11 && static_cast<uint16_t>(offset) + 4 + sidestreetLen <= frame.len) {
-      score += 1;
-    } else if (sidestreetLen > 0x11) {
-      continue;
-    }
-
-    if (!best.valid || score > best.score) {
-      best.valid = true;
-      best.offset = offset;
-      best.mainElement = mainElement;
-      best.direction = direction;
-      best.zLevel = zLevel;
-      best.sidestreetLen = sidestreetLen;
-      best.score = score;
-    }
+  const uint8_t sidestreetLen = frame.data[3];
+  if (frame.data[0] > 0x33 || static_cast<uint16_t>(4 + sidestreetLen) > frame.len) {
+    return descriptor;
   }
 
-  if (!best.valid || best.score < 7) {
-    NavManeuverDescriptorCandidate invalid = {false, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, -1};
-    return invalid;
-  }
-
-  return best;
+  descriptor.valid = true;
+  descriptor.mainElement = frame.data[0];
+  descriptor.direction = frame.data[1];
+  descriptor.zLevel = frame.data[2];
+  descriptor.sidestreetLen = sidestreetLen;
+  return descriptor;
 }
 
 void refreshNavLines() {
@@ -2068,29 +2183,25 @@ void refreshNavLines() {
   setNavLines(top, bottom);
 }
 
-void formatNavManeuver(uint8_t maneuverKind, uint8_t maneuverCode, char *out, uint8_t outSize) {
+void formatNavManeuver(uint8_t mainElement, uint8_t direction, char *out, uint8_t outSize) {
   if (outSize == 0) {
     return;
   }
 
-  if (maneuverCode == 0xFF || !navShowManeuverCodes) {
+  if (mainElement == 0xFF || direction == 0xFF || !navShowManeuverCodes) {
     out[0] = '\0';
     return;
   }
 
-  char code[3] = {};
-  char kind[3] = {};
-  formatHexByte(maneuverCode, code);
-  formatHexByte(maneuverKind, kind);
-  if (maneuverKind != 0xFF) {
-    snprintf(out, outSize, "K%sM%s", kind + 1, code);
-  } else {
-    snprintf(out, outSize, "M%s", code);
-  }
+  char mainCode[3] = {};
+  char directionCode[3] = {};
+  formatHexByte(mainElement, mainCode);
+  formatHexByte(direction, directionCode);
+  snprintf(out, outSize, "E%s D%s", mainCode, directionCode);
 }
 
 void rebuildNavManeuverText() {
-  formatNavManeuver(navManeuverKind, navManeuverCode, navManeuverText, sizeof(navManeuverText));
+  formatNavManeuver(navManeuverMainElement, navManeuverDirection, navManeuverText, sizeof(navManeuverText));
   refreshNavLines();
 }
 
@@ -2128,12 +2239,9 @@ bool updateNavRouteActive(const BapDecodedFrame &frame) {
       copyAudioLine(navManeuverText, "");
       copyAudioLine(navCurrentStreetText, "");
       copyAudioLine(navNextStreetText, "");
-      navManeuverCode = 0xFF;
-      navManeuverKind = 0xFF;
       navManeuverMainElement = 0xFF;
       navManeuverDirection = 0xFF;
       navManeuverZLevel = 0xFF;
-      navManeuverRecordOffset = 0xFF;
     }
     refreshNavLines();
     applyAutomaticDdpPriority();
@@ -2212,60 +2320,41 @@ bool updateNavStreetText(const BapDecodedFrame &frame) {
 }
 
 bool updateNavManeuver(const BapDecodedFrame &frame) {
-  if (frame.port != 21 || frame.len < 7) {
+  if (frame.port != 23 || frame.len < 4) {
     return false;
   }
 
-  const NavManeuverDescriptorCandidate descriptor = decodeNavManeuverDescriptorCandidate(frame);
-  const uint8_t newKind = frame.data[0];
-  const uint8_t newCode = frame.data[6];
-  const bool invalidCode = newCode == 0xFF || newKind == 0xFF;
+  const NavManeuverDescriptor descriptor = decodeNavManeuverDescriptor(frame);
 
-  if (invalidCode) {
-    if (navManeuverText[0] != '\0' || navManeuverCode != 0xFF || navManeuverKind != 0xFF ||
-        navManeuverMainElement != 0xFF || navManeuverDirection != 0xFF || navManeuverRecordOffset != 0xFF) {
-      navManeuverCode = 0xFF;
-      navManeuverKind = 0xFF;
+  if (!descriptor.valid) {
+    if (navManeuverText[0] != '\0' || navManeuverMainElement != 0xFF || navManeuverDirection != 0xFF) {
       navManeuverMainElement = 0xFF;
       navManeuverDirection = 0xFF;
       navManeuverZLevel = 0xFF;
-      navManeuverRecordOffset = 0xFF;
       copyAudioLine(navManeuverText, "");
       refreshNavLines();
     }
     return true;
   }
 
-  const uint8_t newMainElement = descriptor.valid ? descriptor.mainElement : 0xFF;
-  const uint8_t newDirection = descriptor.valid ? descriptor.direction : 0xFF;
-  const uint8_t newZLevel = descriptor.valid ? descriptor.zLevel : 0xFF;
-  const uint8_t newOffset = descriptor.valid ? descriptor.offset : 0xFF;
-
-  if (newCode != navManeuverCode || newKind != navManeuverKind ||
-      newMainElement != navManeuverMainElement || newDirection != navManeuverDirection ||
-      newZLevel != navManeuverZLevel || newOffset != navManeuverRecordOffset) {
-    navManeuverCode = newCode;
-    navManeuverKind = newKind;
-    navManeuverMainElement = newMainElement;
-    navManeuverDirection = newDirection;
-    navManeuverZLevel = newZLevel;
-    navManeuverRecordOffset = newOffset;
-    formatNavManeuver(navManeuverKind, navManeuverCode, navManeuverText, sizeof(navManeuverText));
+  if (descriptor.mainElement != navManeuverMainElement || descriptor.direction != navManeuverDirection ||
+      descriptor.zLevel != navManeuverZLevel) {
+    navManeuverMainElement = descriptor.mainElement;
+    navManeuverDirection = descriptor.direction;
+    navManeuverZLevel = descriptor.zLevel;
+    formatNavManeuver(navManeuverMainElement, navManeuverDirection, navManeuverText,
+                      sizeof(navManeuverText));
     navManeuverUpdates++;
     refreshNavLines();
     if (bapLogging || navSniffMode) {
       Serial.print("nav maneuver update: ");
       Serial.print(navManeuverText);
-      Serial.print(" kind=0x");
-      Serial.print(navManeuverKind, HEX);
-      Serial.print(" code=0x");
-      Serial.print(navManeuverCode, HEX);
       Serial.print(" main=0x");
       Serial.print(navManeuverMainElement, HEX);
       Serial.print(" dir=0x");
       Serial.print(navManeuverDirection, HEX);
-      Serial.print(" off=");
-      Serial.println(navManeuverRecordOffset);
+      Serial.print(" z=0x");
+      Serial.println(navManeuverZLevel, HEX);
     }
   }
   return true;
@@ -2277,12 +2366,9 @@ void clearNavText() {
   copyAudioLine(navManeuverText, "");
   copyAudioLine(navCurrentStreetText, "");
   copyAudioLine(navNextStreetText, "");
-  navManeuverCode = 0xFF;
-  navManeuverKind = 0xFF;
   navManeuverMainElement = 0xFF;
   navManeuverDirection = 0xFF;
   navManeuverZLevel = 0xFF;
-  navManeuverRecordOffset = 0xFF;
   setNavLines("NAV", "Waiting route");
   applyAutomaticDdpPriority();
 }
@@ -2546,6 +2632,8 @@ void rewriteDimmingFrame(CAN_message_t &msg) {
 
 void printStatus() {
   Serial.println("Status:");
+  Serial.print("  firmwareVersion=");
+  Serial.println(FIRMWARE_VERSION);
   Serial.print("  bypassMode=");
   Serial.println(bypassMode ? "on" : "off");
   Serial.print("  verboseLogging=");
@@ -2601,7 +2689,7 @@ void printStatus() {
   Serial.println(ddpBootStartPending ? "yes" : "no");
   if (ddpBootStartPending) {
     const uint32_t now = millis();
-    const uint32_t remainingMs = ddpBootStartMs > now ? ddpBootStartMs - now : 0;
+    const uint32_t remainingMs = deadlineReached(now, ddpBootStartMs) ? 0 : ddpBootStartMs - now;
     Serial.print("  ddpBootStartInMs=");
     Serial.println(remainingMs);
   }
@@ -2645,16 +2733,12 @@ void printStatus() {
   Serial.println(navShowManeuverCodes ? "on" : "off");
   Serial.print("  navRouteActive=");
   Serial.println(navRouteActive ? "yes" : "no");
-  Serial.print("  navManeuver=kind 0x");
-  Serial.print(navManeuverKind, HEX);
-  Serial.print(" code 0x");
-  Serial.print(navManeuverCode, HEX);
-  Serial.print(" main 0x");
+  Serial.print("  navManeuver=main 0x");
   Serial.print(navManeuverMainElement, HEX);
   Serial.print(" dir 0x");
   Serial.print(navManeuverDirection, HEX);
-  Serial.print(" off 0x");
-  Serial.print(navManeuverRecordOffset, HEX);
+  Serial.print(" z 0x");
+  Serial.print(navManeuverZLevel, HEX);
   Serial.print(" text=");
   Serial.println(navManeuverText);
   Serial.print("  bapLogging=");
@@ -2857,8 +2941,8 @@ void printHelp() {
   Serial.println("  audio clear  - reset Audio page text to defaults");
   Serial.println("  steering on/off/log - gate MFD up/down as radio next/prev only while Audio page is active");
   Serial.println("  nav on/off   - enable or disable BAP_NAVI->DDP nav text translation");
-  Serial.println("  nav arrows   - toggle experimental left/right maneuver hints from observed MIB2 code families");
-  Serial.println("  nav codes    - toggle raw maneuver code display, e.g. M35");
+  Serial.println("  nav arrows   - toggle DDP maneuver graphics decoded from BAP function 23");
+  Serial.println("  nav codes    - toggle raw MainElement/Direction display, e.g. E0D D40");
   Serial.println("  nav sniff    - toggle focused nav sniffing on 0x67C, 0x67D, and 0x3A2");
   Serial.println("  clock sniff  - toggle focused clock sniffing on 0x623, 0x65D, and nearby 0x65x candidates");
   Serial.println("  wakeids      - show recently active CAN IDs on both sides of the bridge");
@@ -3193,8 +3277,9 @@ void processCommand(char *line) {
     if (strcmp(subcommand, "test") == 0) {
       navRouteActive = true;
       copyAudioLine(navDistanceText, "450 ft");
-      navManeuverKind = 0x04;
-      navManeuverCode = 0x35;
+      navManeuverMainElement = 0x0D;
+      navManeuverDirection = 0x40;
+      navManeuverZLevel = 0x00;
       rebuildNavManeuverText();
       copyAudioLine(navNextStreetText, "B St");
       copyAudioLine(navCurrentStreetText, "Spring St");
@@ -3380,6 +3465,8 @@ void setup() {
 
   Serial.println();
   Serial.println("Mk5 MIB2 dimming bridge starting");
+  Serial.print("Firmware: ");
+  Serial.println(FIRMWARE_VERSION);
   Serial.println("Assumed bus speed: 100000");
   Serial.println("Dimming frame: 0x635");
   Serial.println("Send 'h' over USB serial for commands.");
