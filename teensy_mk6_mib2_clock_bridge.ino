@@ -1,5 +1,6 @@
 #include <FlexCAN_T4.h>
 
+static constexpr const char *FIRMWARE_VERSION = "MK6-CLOCK-STABLE-2026-07-10";
 static constexpr uint32_t BUS_SPEED = 100000;
 static constexpr uint32_t CLOCK_DIAG_1_CAN_ID = 0x65D;
 static constexpr uint32_t CLOCK_KOMBI_K2_CAN_ID = 0x623;
@@ -23,6 +24,7 @@ static constexpr uint8_t OBSERVED_ID_SLOTS = 16;
 static constexpr uint32_t OBSERVED_ID_WINDOW_MS = 3000;
 static constexpr uint32_t CLOCK_REPEAT_INTERVAL_MS = 1000;
 static constexpr uint32_t CLOCK_REPEAT_ACTIVE_HOLD_MS = 5000;
+static constexpr uint32_t CLOCK_CACHE_FRESHNESS_MS = 3000;
 static constexpr uint32_t RADIO_WAKE_BURST_GAP_MS = 250;
 static constexpr uint8_t RADIO_WAKE_MIN_BURST_FRAMES = 8;
 static constexpr uint8_t RADIO_WAKE_MIN_NON436_FRAMES = 2;
@@ -59,6 +61,8 @@ static uint8_t cachedClock65dLen = 0;
 static uint32_t lastClock65dVehicleMs = 0;
 static uint32_t lastClockRepeatMs = 0;
 static uint32_t repeatedClock65dToRadio = 0;
+static uint32_t rejectedClock65dFrames = 0;
+static uint32_t failedClock65dRepeats = 0;
 static uint32_t radioWakeBurstStartedMs = 0;
 static uint32_t lastRadioWakeFrameMs = 0;
 static uint8_t radioWakeBurstFrames = 0;
@@ -205,12 +209,25 @@ bool isRadioAwakeSignalFrame(const CAN_message_t &msg) {
   }
 }
 
+bool deadlineActive(uint32_t now, uint32_t deadline) {
+  return deadline != 0 && static_cast<int32_t>(deadline - now) >= 0;
+}
+
+bool clockRepeatAllowedNow(uint32_t now) {
+  return deadlineActive(now, radioClockRepeatAllowedUntilMs);
+}
+
+bool clockCacheFreshNow(uint32_t now) {
+  return cachedClock65dValid && now - lastClock65dVehicleMs <= CLOCK_CACHE_FRESHNESS_MS;
+}
+
 void noteRadioWakeActivity(const CAN_message_t &msg) {
   if (!isRadioAwakeSignalFrame(msg)) {
     return;
   }
 
   const uint32_t now = millis();
+  const bool wasRepeatAllowed = clockRepeatAllowedNow(now);
   if (lastRadioWakeFrameMs == 0 || now - lastRadioWakeFrameMs > RADIO_WAKE_BURST_GAP_MS) {
     radioWakeBurstStartedMs = now;
     radioWakeBurstFrames = 1;
@@ -230,17 +247,18 @@ void noteRadioWakeActivity(const CAN_message_t &msg) {
       radioWakeBurstNon436Frames >= RADIO_WAKE_MIN_NON436_FRAMES) {
     radioClockRepeatAllowedUntilMs = now + CLOCK_REPEAT_ACTIVE_HOLD_MS;
   } else if (msg.id != POWER_COMPAT_CAN_ID_436 && radioClockRepeatAllowedUntilMs != 0 &&
-             now <= radioClockRepeatAllowedUntilMs) {
+             clockRepeatAllowedNow(now)) {
     radioClockRepeatAllowedUntilMs = now + CLOCK_REPEAT_ACTIVE_HOLD_MS;
+  }
+
+  if (!wasRepeatAllowed && clockRepeatAllowedNow(now)) {
+    // Start each qualified radio wake with an immediate clock update.
+    lastClockRepeatMs = 0;
   }
 }
 
-bool clockRepeatAllowedNow(uint32_t now) {
-  return radioClockRepeatAllowedUntilMs != 0 && now <= radioClockRepeatAllowedUntilMs;
-}
-
 void sendClockRepeatToRadio() {
-  if (!cachedClock65dValid || cachedClock65dLen == 0) {
+  if (!clockCacheFreshNow(millis()) || cachedClock65dLen != 8) {
     return;
   }
 
@@ -252,8 +270,11 @@ void sendClockRepeatToRadio() {
     msg.buf[i] = cachedClock65d[i];
   }
 
-  canRadio.write(msg);
-  repeatedClock65dToRadio++;
+  if (canRadio.write(msg)) {
+    repeatedClock65dToRadio++;
+  } else {
+    failedClock65dRepeats++;
+  }
   lastClockRepeatMs = millis();
 
   if (verboseLogging) {
@@ -268,6 +289,11 @@ void tickClockRepeat() {
 
   const uint32_t now = millis();
   if (!clockRepeatAllowedNow(now)) {
+    radioClockRepeatAllowedUntilMs = 0;
+    return;
+  }
+
+  if (!clockCacheFreshNow(now)) {
     return;
   }
 
@@ -288,6 +314,8 @@ void resetCounters() {
   power439VehicleToRadio = 0;
   power439RadioToVehicle = 0;
   repeatedClock65dToRadio = 0;
+  rejectedClock65dFrames = 0;
+  failedClock65dRepeats = 0;
   clearObservedCanIds(vehicleObservedIds, OBSERVED_ID_SLOTS);
   clearObservedCanIds(radioObservedIds, OBSERVED_ID_SLOTS);
 }
@@ -304,6 +332,8 @@ void printHelp() {
 
 void printStatus() {
   Serial.println("Status:");
+  Serial.print("  firmwareVersion=");
+  Serial.println(FIRMWARE_VERSION);
   Serial.print("  verboseLogging=");
   Serial.println(verboseLogging ? "on" : "off");
   Serial.print("  forwarded vehicle->radio=");
@@ -316,6 +346,10 @@ void printStatus() {
   Serial.println(clock65dRadioToVehicle);
   Serial.print("  0x65D repeated->radio=");
   Serial.println(repeatedClock65dToRadio);
+  Serial.print("  0x65D rejected/failed-repeat=");
+  Serial.print(rejectedClock65dFrames);
+  Serial.print("/");
+  Serial.println(failedClock65dRepeats);
   Serial.print("  0x623 vehicle->radio/radio->vehicle=");
   Serial.print(clock623VehicleToRadio);
   Serial.print("/");
@@ -344,6 +378,8 @@ void printStatus() {
   Serial.println(clockRepeatEnabled ? "on" : "off");
   Serial.print("  cachedClock65dValid=");
   Serial.println(cachedClock65dValid ? "yes" : "no");
+  Serial.print("  cachedClock65dFresh=");
+  Serial.println(clockCacheFreshNow(millis()) ? "yes" : "no");
   Serial.print("  clockRepeatAllowedNow=");
   Serial.println(clockRepeatAllowedNow(millis()) ? "yes" : "no");
 }
@@ -384,6 +420,8 @@ void processCommand(char *line) {
 
     if (strcmp(subcommand, "off") == 0) {
       clockRepeatEnabled = false;
+      radioClockRepeatAllowedUntilMs = 0;
+      lastClockRepeatMs = 0;
       Serial.println("clockRepeatEnabled=off");
       return;
     }
@@ -422,7 +460,7 @@ void processSerialCommands() {
       continue;
     }
 
-    if (serialBufferLen + 1 < sizeof(serialBuffer)) {
+    if (static_cast<size_t>(serialBufferLen) + 1 < sizeof(serialBuffer)) {
       serialBuffer[serialBufferLen++] = c;
     } else {
       serialBufferLen = 0;
@@ -452,13 +490,15 @@ void handleVehicleToRadio() {
 
     if (msg.id == CLOCK_DIAG_1_CAN_ID) {
       clock65dVehicleToRadio++;
-      if (msg.len <= sizeof(cachedClock65d)) {
+      if (!msg.flags.extended && msg.len == sizeof(cachedClock65d)) {
         cachedClock65dLen = msg.len;
         for (uint8_t i = 0; i < msg.len; ++i) {
           cachedClock65d[i] = msg.buf[i];
         }
         cachedClock65dValid = true;
         lastClock65dVehicleMs = lastVehicleActivityMs;
+      } else {
+        rejectedClock65dFrames++;
       }
     } else if (msg.id == CLOCK_KOMBI_K2_CAN_ID) {
       clock623VehicleToRadio++;
@@ -508,6 +548,8 @@ void setup() {
 
   Serial.println();
   Serial.println("Mk6 MIB2 clock bridge starting");
+  Serial.print("Firmware: ");
+  Serial.println(FIRMWARE_VERSION);
   Serial.println("Assumed bus speed: 100000");
   Serial.println("Clock focus: 0x65D / 0x623");
   Serial.println("Clock repeater: enabled, radio-side awake gated");
